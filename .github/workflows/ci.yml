@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install psycopg2 for the Python example
+        run: sudo apt-get update && sudo apt-get install -y python3-psycopg2
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      - name: Test
+        env:
+          DOUBLEDIP_TEST_DB: postgres://postgres:postgres@127.0.0.1:5432/postgres
+        run: go test -race ./...
+      - name: Run doubledip on the example shop
+        env:
+          PGPASSWORD: postgres
+        run: |
+          go build -o /tmp/doubledip ./cmd/doubledip
+          go build -o /tmp/shop ./examples/shop
+          psql -h 127.0.0.1 -U postgres -c 'CREATE DATABASE shop'
+          set +e
+          /tmp/doubledip --db postgres://postgres:postgres@127.0.0.1:5432/shop \
+            --app /tmp/shop --ready http://localhost:8080/health \
+            'curl -sS -X POST "localhost:8080/redeem?code=WELCOME&user=u$DOUBLEDIP_N"'
+          code=$?
+          set -e
+          test "$code" = 1 || { echo "expected exit 1 (race confirmed), got $code"; exit 1; }
