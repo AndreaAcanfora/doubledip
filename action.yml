@@ -68,7 +68,7 @@ runs:
         ARGS: ${{ inputs.args }}
         FAIL: ${{ inputs.fail-on-race }}
       run: |
-        set -uo pipefail
+        set +e -uo pipefail
         report="$RUNNER_TEMP/doubledip-report.json"
         # ARGS is split on spaces on purpose: it holds extra flags.
         doubledip --config "$CONFIG" --markdown "$GITHUB_STEP_SUMMARY" --report "$report" $ARGS
