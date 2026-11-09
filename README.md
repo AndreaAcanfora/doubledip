@@ -57,11 +57,14 @@ An account with 100 paid out 160. That is a real run against
 
 ## Install
 
+Download a binary for Linux (amd64, arm64) or macOS (Apple silicon) from the
+[latest release](https://github.com/AndreaAcanfora/doubledip/releases/latest), or build it:
+
 ```sh
 go install github.com/AndreaAcanfora/doubledip/cmd/doubledip@latest
 ```
 
-It needs Go 1.25+ and a C compiler: doubledip parses SQL with the real Postgres
+Building needs Go 1.25+ and a C compiler: doubledip parses SQL with the real Postgres
 parser ([libpg_query](https://github.com/pganalyze/pg_query_go)).
 
 ## Use
