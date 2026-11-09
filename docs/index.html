@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>doubledip</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23c4372b'/><text x='16' y='22' font-family='monospace' font-size='15' font-weight='700' fill='white' text-anchor='middle'>x2</text></svg>">
+<meta name="description" content="Send the same request twice at the same moment and see what your database does. Replays of real doubledip runs.">
+<style>
+:root {
+  --bg: #fbfaf7; --panel: #ffffff; --ink: #1d1c1a; --muted: #6b6760; --line: #e6e2da;
+  --red: #c4372b; --red-bg: #fbe9e6; --green: #1f7a4d; --green-bg: #e5f4ec; --amber: #a86a00; --amber-bg: #fdf1dc;
+  --a: #3557c9; --a-bg: #e9eefc; --b: #9a3fb5; --b-bg: #f5e9fa; --code: #f3f1ec;
+  --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #131312; --panel: #1b1b1a; --ink: #ecebe7; --muted: #9b978f; --line: #2d2c2a;
+    --red: #ff7b6b; --red-bg: #3a1d19; --green: #5fd39a; --green-bg: #15301f; --amber: #f2b24c; --amber-bg: #33270f;
+    --a: #8aa5ff; --a-bg: #1d2541; --b: #d790ef; --b-bg: #301d39; --code: #232220;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.55 var(--sans); }
+main { max-width: 1040px; margin: 0 auto; padding: 40px 16px 80px; }
+a { color: inherit; }
+code, pre { font-family: var(--mono); font-size: 13.5px; }
+header h1 { font-size: clamp(30px, 6vw, 48px); line-height: 1.1; margin: 0 0 12px; letter-spacing: -0.02em; }
+header h1 span { color: var(--red); }
+header p { margin: 0 0 8px; color: var(--muted); max-width: 680px; font-size: 18px; }
+.install { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 20px 0 36px; }
+.install pre { margin: 0; background: var(--code); border: 1px solid var(--line); padding: 10px 14px; border-radius: 8px; overflow-x: auto; max-width: 100%; }
+.install a.btn { text-decoration: none; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); font-weight: 600; font-size: 14px; }
+.tabs { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin-bottom: 18px; }
+.tab { text-align: left; cursor: pointer; border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 10px; padding: 12px 14px; font: inherit; }
+.tab b { display: block; font-size: 15px; }
+.tab small { color: var(--muted); }
+.tab[aria-selected="true"] { border-color: var(--ink); box-shadow: 0 0 0 1px var(--ink); }
+.toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; margin-bottom: 14px; }
+.toggle button { border: 0; background: transparent; color: var(--muted); padding: 7px 14px; font: 600 14px var(--sans); cursor: pointer; }
+.toggle button[aria-pressed="true"] { background: var(--ink); color: var(--bg); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; margin-bottom: 16px; }
+.card h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 12px; }
+.req { font-family: var(--mono); font-size: 13px; background: var(--code); padding: 8px 10px; border-radius: 6px; overflow-x: auto; white-space: nowrap; }
+.controls { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+.controls button { font: 600 14px var(--sans); border: 1px solid var(--line); background: var(--panel); color: var(--ink); border-radius: 8px; padding: 7px 12px; cursor: pointer; }
+.controls button.primary { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+.controls .note { color: var(--muted); font-size: 13px; }
+.lanes { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.lanehead { font: 600 13px var(--sans); padding: 6px 10px; border-radius: 6px; }
+.lanehead.a { background: var(--a-bg); color: var(--a); }
+.lanehead.b { background: var(--b-bg); color: var(--b); }
+.row { display: contents; }
+.cell { min-height: 0; }
+.stmt { font-family: var(--mono); font-size: 12.5px; border-radius: 6px; padding: 7px 9px; border: 1px solid var(--line); background: var(--bg); word-break: break-word; transition: opacity .25s, transform .25s; }
+.stmt.hidden { opacity: 0; transform: translateY(4px); }
+.stmt.a { border-left: 3px solid var(--a); }
+.stmt.b { border-left: 3px solid var(--b); }
+.stmt .meta { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); font-size: 11.5px; margin-top: 3px; }
+.stmt.err { border-color: var(--red); }
+.stmt.err .meta .tag { color: var(--red); }
+.stmt.held { box-shadow: inset 0 0 0 1px var(--amber); }
+.barrier { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; color: var(--amber); font: 600 12.5px var(--sans); transition: opacity .25s; }
+.barrier::before, .barrier::after { content: ""; flex: 1; border-top: 2px dashed var(--amber); }
+.barrier.hidden { opacity: 0; }
+.verdict { display: flex; gap: 14px; align-items: flex-start; border-radius: 12px; padding: 16px 18px; margin-bottom: 16px; }
+.verdict.bad { background: var(--red-bg); }
+.verdict.good { background: var(--green-bg); }
+.verdict .big { font-size: 26px; line-height: 1; }
+.verdict b { font-size: 18px; display: block; margin-bottom: 4px; }
+.verdict.bad b { color: var(--red); }
+.verdict.good b { color: var(--green); }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { color: var(--muted); font-weight: 600; font-size: 12.5px; }
+td code { font-size: 12.5px; }
+.diff { font-family: var(--mono); font-size: 13px; }
+.diff div { padding: 2px 8px; border-radius: 4px; }
+.diff .minus { background: var(--red-bg); color: var(--red); }
+.diff .plus { background: var(--green-bg); color: var(--green); }
+.diff .h { color: var(--muted); margin-top: 6px; }
+ul.fix { margin: 0; padding-left: 18px; }
+ul.fix li { margin-bottom: 6px; }
+.how { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; counter-reset: s; margin-top: 8px; }
+.how div { counter-increment: s; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; font-size: 14.5px; }
+.how div::before { content: counter(s); display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%; background: var(--ink); color: var(--bg); font: 700 12px var(--sans); margin-bottom: 8px; }
+h3.section { font-size: 22px; margin: 44px 0 6px; }
+footer { color: var(--muted); font-size: 14px; margin-top: 48px; }
+@media (max-width: 700px) {
+  .grid2 { grid-template-columns: 1fr; }
+  .stmt { font-size: 11.5px; padding: 6px 7px; }
+}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <h1>Send the same request <span>twice</span>, at the same moment.</h1>
+  <p>doubledip sits between your app and Postgres, holds two copies of a request right before they write, and shows what your database looks like afterwards. Double-redeemed coupons, negative balances and duplicate accounts, reproduced on demand.</p>
+  <p>Below are replays of real runs against <a href="https://github.com/AndreaAcanfora/doubledip/tree/main/examples/shop">the example shop</a>: every statement, every timing, every row is what doubledip recorded.</p>
+</header>
+<div class="install">
+  <pre>go install github.com/AndreaAcanfora/doubledip/cmd/doubledip@latest</pre>
+  <a class="btn" href="https://github.com/AndreaAcanfora/doubledip">GitHub →</a>
+</div>
+
+<div class="tabs" id="tabs" role="tablist"></div>
+<div class="toggle" id="toggle" role="group" aria-label="Version of the endpoint">
+  <button data-v="0" aria-pressed="true">Vulnerable</button>
+  <button data-v="1" aria-pressed="false">Fixed</button>
+</div>
+
+<div class="card">
+  <h2>The request, sent twice</h2>
+  <div class="req" id="req"></div>
+</div>
+
+<div class="card">
+  <h2>What the database saw</h2>
+  <div class="controls">
+    <button class="primary" id="play">▶ Replay</button>
+    <button id="all">Show all</button>
+    <span class="note" id="note"></span>
+  </div>
+  <div class="lanes" id="lanes"></div>
+</div>
+
+<div id="result"></div>
+
+<h3 class="section">How it works</h3>
+<div class="how">
+  <div><b>Record.</b> The request runs once through doubledip's Postgres proxy. Every statement, its transaction and isolation level are noted.</div>
+  <div><b>Find.</b> The real Postgres parser spots reads followed by writes to the same table: the window a second request can slip into.</div>
+  <div><b>Serial runs.</b> The two requests run one after the other, in both orders, from the same data. Those are the correct outcomes.</div>
+  <div><b>Race.</b> Both start together. The proxy holds the first to reach the write until the second gets there, then releases both.</div>
+  <div><b>Compare.</b> Any row no serial order produces is a confirmed race, shown with the fix.</div>
+</div>
+
+<footer>doubledip is MIT-licensed. <a href="https://github.com/AndreaAcanfora/doubledip">Source, docs and the GitHub Action</a>.</footer>
+</main>
+
+<script src="runs.js"></script>
+<script>
+(() => {
+  const RUNS = window.RUNS;
+  const byName = Object.fromEntries(RUNS.scenarios.map(s => [s.name, s]));
+  const PAIRS = [
+    { title: "Single-use coupon", sub: "check uses, then redeem", v: ["redeem a single-use coupon", "redeem a single-use coupon (FOR UPDATE)"], fixed: "SELECT … FOR UPDATE" },
+    { title: "Withdraw 80 from 100", sub: "check balance, then subtract", v: ["withdraw 80 from 100", "withdraw 80 from 100 (guarded UPDATE)"], fixed: "UPDATE … WHERE balance >= $1" },
+    { title: "Sign up", sub: "check the email is free, then insert", v: ["sign up with the same email", "sign up with the same email (unique index)"], fixed: "a unique index" },
+  ];
+  let pair = 0, ver = 0, timer = null;
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+  const oneLine = s => s.replace(/\s+/g, " ").trim();
+  const sentence = s => s ? s[0].toUpperCase() + s.slice(1) + "." : "";
+
+  function tabs() {
+    $("tabs").innerHTML = PAIRS.map((p, i) => `<button class="tab" role="tab" aria-selected="${i === pair}" data-i="${i}"><b>${esc(p.title)}</b><small>${esc(p.sub)}</small></button>`).join("");
+    $("tabs").querySelectorAll(".tab").forEach(b => b.onclick = () => { pair = +b.dataset.i; ver = 0; render(); });
+    $("toggle").querySelectorAll("button").forEach(b => {
+      b.setAttribute("aria-pressed", +b.dataset.v === ver);
+      b.textContent = +b.dataset.v === 0 ? "Vulnerable" : "Fixed with " + PAIRS[pair].fixed;
+      b.onclick = () => { ver = +b.dataset.v; render(); };
+    });
+  }
+
+  function render() {
+    tabs();
+    const s = byName[PAIRS[pair].v[ver]];
+    const f = s.findings[0];
+    $("req").textContent = s.requests[0];
+    // Lanes: one per connection, in order of first statement.
+    const trace = [...f.trace].sort((x, y) => x.start_ms - y.start_ms);
+    const conns = [...new Set(trace.map(t => t.conn))];
+    const lane = c => conns.indexOf(c) === 0 ? "a" : "b";
+    let html = `<div class="lanehead a">Connection ${conns[0]} · started first</div><div class="lanehead b">Connection ${conns[1] ?? "–"} · started second</div>`;
+    // A barrier line goes after the last held statement starts: both are waiting there.
+    const held = trace.filter(t => t.held);
+    let barrierAt = -1;
+    if (held.length) barrierAt = trace.indexOf(held[held.length - 1]);
+    trace.forEach((t, i) => {
+      const l = lane(t.conn);
+      const dur = (t.end_ms - t.start_ms);
+      const tag = t.error ? "ERROR " + t.error.split(" ")[0] : (t.tag || "");
+      const human = dur >= 1000 ? (dur / 1000).toFixed(1) + " s" : dur.toFixed(1) + " ms";
+      const waited = t.held ? ` · held ${human}` : dur > 100 ? ` · waited ${human} for a lock` : "";
+      const params = t.params && t.params.length ? ` <span style="color:var(--muted)">[${esc(t.params.join(", "))}]</span>` : "";
+      const box = `<div class="stmt ${l} hidden${t.error ? " err" : ""}${t.held ? " held" : ""}" data-i="${i}">${esc(oneLine(t.sql))}${params}<div class="meta"><span>${t.start_ms.toFixed(1)} ms${waited}</span><span class="tag">${esc(tag)}</span></div></div>`;
+      html += l === "a" ? `${box}<div></div>` : `<div></div>${box}`;
+      if (i === barrierAt) {
+        const msg = f.arrived >= 2 ? "both requests held here, then released together" : "request 2 never reached the write: released after the timeout";
+        html += `<div class="barrier hidden" data-i="${i}">⏸ ${msg}</div>`;
+      }
+    });
+    $("lanes").innerHTML = html;
+    $("note").textContent = `${trace.length} statements on ${conns.length} connections`;
+    result(s, f);
+    play();
+  }
+
+  function play() {
+    clearInterval(timer);
+    const items = [...$("lanes").querySelectorAll(".stmt, .barrier")];
+    items.forEach(el => el.classList.add("hidden"));
+    let k = 0;
+    timer = setInterval(() => {
+      if (k >= items.length) return clearInterval(timer);
+      items[k++].classList.remove("hidden");
+    }, 420);
+  }
+  function showAll() {
+    clearInterval(timer);
+    $("lanes").querySelectorAll(".hidden").forEach(el => el.classList.remove("hidden"));
+  }
+
+  function result(s, f) {
+    const bad = f.outcome === "confirmed";
+    const title = bad ? "Race confirmed" : f.outcome === "safe" ? "Safe" : "Serialized";
+    const text = bad
+      ? `Both requests passed the check. The database now holds rows that running them one after the other never produces.`
+      : f.outcome === "safe"
+        ? `Both requests were held at the write, and the database still matched a serial run. ${esc(sentence(f.why))}`
+        : `The second request could not get past its read while the first waited at the write. ${esc(sentence(f.why))}`;
+    const out = r => `exit ${r.exit_code} <code>${esc(oneLine(r.output))}</code>`;
+    let html = `<div class="verdict ${bad ? "bad" : "good"}"><div class="big">${bad ? "✗" : "✓"}</div><div><b>${title}: ${esc(f.pattern)} on ${esc(f.table)}</b>${text}</div></div>`;
+    html += `<div class="grid2"><div class="card"><h2>What the requests answered</h2><table><tr><th></th><th>request 1</th><th>request 2</th></tr>
+      <tr><td>one after the other</td><td>${out(f.serial[0])}</td><td>${out(f.serial[1])}</td></tr>
+      <tr><td>at the same time</td><td>${out(f.concurrent[0])}</td><td>${out(f.concurrent[1])}</td></tr></table></div>`;
+    if (bad) {
+      html += `<div class="card"><h2>Database: serial vs concurrent</h2><div class="diff">` + f.diff.map(d =>
+        `<div class="h">${esc(d.table)}: ${d.serial_rows} → ${d.concurrent_rows} rows</div>` +
+        (d.only_serial || []).map(r => `<div class="minus">- ${esc(r)}</div>`).join("") +
+        (d.only_concurrent || []).map(r => `<div class="plus">+ ${esc(r)}</div>`).join("")).join("") + `</div></div></div>`;
+      html += `<div class="card"><h2>Fix</h2><ul class="fix">${f.fix.map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>`;
+    } else {
+      html += `<div class="card"><h2>Database</h2><p style="margin:0">Same rows as a serial run. Nothing to fix.</p></div></div>`;
+    }
+    $("result").innerHTML = html;
+  }
+
+  $("play").onclick = play;
+  $("all").onclick = showAll;
+  render();
+})();
+</script>
+</body>
+</html>

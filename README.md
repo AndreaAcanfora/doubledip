@@ -42,7 +42,7 @@ recorded 3 statements in 3 transactions
 ```
 
 An account with 100 paid out 160. That is a real run against
-[`examples/shop`](examples/shop/main.go).
+[`examples/shop`](examples/shop/main.go). **[See it replayed step by step →](https://andreaacanfora.github.io/doubledip/)**
 
 - **No code changes, any language.** doubledip speaks the Postgres wire protocol.
   Tested with pgx (Go, prepared statements), psycopg2 (Python, simple protocol) and
@@ -90,11 +90,75 @@ Exit status: `0` nothing reproduced, `1` race confirmed, `2` error. It works in 
 
 | flag | default | |
 |---|---|---|
+| `--config` | `doubledip.yml` if present | run the scenarios of a config file |
+| `--only` | | run only the scenarios whose name contains this text |
 | `--barrier-timeout` | `3s` | how long the first request waits at the write for the second |
-| `--max` | `8` | candidate races to test per run |
+| `--max` | `8` | candidate races to test per scenario |
 | `--ignore` | | `table.column` list left out of comparisons |
-| `--json` | | machine-readable report |
+| `--json` | | print the report as JSON instead of text |
+| `--report` | | also write the JSON report to a file |
+| `--markdown` | | also write a Markdown report to a file (e.g. `$GITHUB_STEP_SUMMARY`) |
 | `-v` | | show the app's output |
+
+The JSON report includes a trace of the concurrent run: every statement, its
+connection, its timing and whether it was held at the barrier.
+
+### Config file
+
+Check every endpoint that matters in one run, with the app started once.
+`${VAR}` in `db`, `app`, `ready` and `listen` comes from the environment; request
+commands are left to the shell.
+
+```yaml
+# doubledip.yml
+db: ${DATABASE_URL}
+app: npm start
+ready: http://localhost:3000/health
+barrier_timeout: 3s
+scenarios:
+  - name: redeem a coupon
+    request: curl -sS -X POST "localhost:3000/coupons/WELCOME/redeem?user=u$DOUBLEDIP_N"
+  - name: withdraw against transfer
+    requests:
+      - curl -sS -X POST localhost:3000/accounts/1/withdraw -d amount=80
+      - curl -sS -X POST localhost:3000/accounts/1/transfer -d amount=80
+    ignore: [audit_log.request_id]
+```
+
+```sh
+doubledip                      # reads doubledip.yml
+doubledip --only coupon        # one scenario
+```
+
+[`examples/shop/doubledip.yml`](examples/shop/doubledip.yml) checks all six endpoints
+of the example shop.
+
+### GitHub Action
+
+```yaml
+jobs:
+  races:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env: { POSTGRES_PASSWORD: postgres }
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      # ... set up your app's toolchain and database schema here ...
+      - uses: AndreaAcanfora/doubledip@v0.2.0
+        env:
+          DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/postgres
+        with:
+          config: doubledip.yml
+```
+
+The step fails when a race is confirmed and writes the report to the job summary.
+Inputs: `config`, `args` (extra flags), `version` (`latest` by default),
+`working-directory` and `fail-on-race` (`true`). Outputs: `confirmed` and `report`
+(path of the JSON report). Linux and macOS runners.
 
 ## How it works
 

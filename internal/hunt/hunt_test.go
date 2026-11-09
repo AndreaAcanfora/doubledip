@@ -105,6 +105,8 @@ func check(t *testing.T, rep *Report, c tcase) {
 	}
 }
 
+// TestShopGo runs every endpoint of the Go example in one session, the
+// way a config file does.
 func TestShopGo(t *testing.T) {
 	db := testDB(t)
 	bin := filepath.Join(t.TempDir(), "shop")
@@ -113,6 +115,16 @@ func TestShopGo(t *testing.T) {
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, out)
 	}
+	addr := freePort(t)
+	t.Setenv("ADDR", addr)
+	s, err := Open(context.Background(), Config{
+		Upstream: db, Listen: "127.0.0.1:0", App: bin, Ready: "http://" + addr + "/health",
+		BarrierTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
 	for _, c := range []tcase{
 		{"redeem?code=WELCOME&user=u$DOUBLEDIP_N", Confirmed},
 		{"redeem-safe?code=SAFE&user=u$DOUBLEDIP_N", NotReached},
@@ -122,8 +134,42 @@ func TestShopGo(t *testing.T) {
 		{"signup-safe?email=a@example.com", Held},
 	} {
 		t.Run(strings.SplitN(c.path, "?", 2)[0], func(t *testing.T) {
-			check(t, hunt(t, db, bin, freePort(t), c), c)
+			rep, err := s.Hunt(context.Background(), Scenario{Name: c.path,
+				Requests: []string{fmt.Sprintf(`curl -sS -X POST "http://%s/%s"`, addr, c.path)}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			check(t, rep, c)
+			// The concurrent run is traced, with the held statements marked.
+			f := rep.Findings[0]
+			if len(f.Trace) < 2 || f.Started.IsZero() {
+				t.Fatalf("no trace: %+v", f.Trace)
+			}
+			var b strings.Builder
+			if err := WriteJSON(&b, "test", []*Report{rep}); err != nil || !strings.Contains(b.String(), `"held": true`) {
+				t.Errorf("JSON trace has no held statement: %v\n%s", err, b.String())
+			}
+			b.Reset()
+			WriteMarkdown(&b, []*Report{rep})
+			if !strings.Contains(b.String(), "| "+c.path+" |") {
+				t.Errorf("markdown:\n%s", b.String())
+			}
 		})
+	}
+}
+
+func TestAppExitsEarly(t *testing.T) {
+	db := testDB(t)
+	_, err := Open(context.Background(), Config{Upstream: db, Listen: "127.0.0.1:0", App: "echo boom; exit 3", Ready: "http://" + freePort(t) + "/"})
+	if err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestRefusesRemoteDatabase(t *testing.T) {
+	_, err := Open(context.Background(), Config{Upstream: "postgres://u@db.example.com/x"})
+	if err == nil || !strings.Contains(err.Error(), "not a local database") {
+		t.Fatalf("got %v", err)
 	}
 }
 

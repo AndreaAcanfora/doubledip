@@ -32,17 +32,33 @@ jobs:
         env:
           DOUBLEDIP_TEST_DB: postgres://postgres:postgres@127.0.0.1:5432/postgres
         run: go test -race ./...
-      - name: Run doubledip on the example shop
+
+  action:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
         env:
-          PGPASSWORD: postgres
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: PGPASSWORD=postgres psql -h 127.0.0.1 -U postgres -c 'CREATE DATABASE shop'
+      - name: Run the action on the example shop
+        id: dd
+        uses: ./
+        env:
+          SHOP_DB: postgres://postgres:postgres@127.0.0.1:5432/shop
+        with:
+          version: source
+          config: examples/shop/doubledip.yml
+          fail-on-race: "false"
+      - name: Expect the three vulnerable endpoints
         run: |
-          go build -o /tmp/doubledip ./cmd/doubledip
-          go build -o /tmp/shop ./examples/shop
-          psql -h 127.0.0.1 -U postgres -c 'CREATE DATABASE shop'
-          set +e
-          /tmp/doubledip --db postgres://postgres:postgres@127.0.0.1:5432/shop \
-            --app /tmp/shop --ready http://localhost:8080/health \
-            'curl -sS -X POST "localhost:8080/redeem?code=WELCOME&user=u$DOUBLEDIP_N"'
-          code=$?
-          set -e
-          test "$code" = 1 || { echo "expected exit 1 (race confirmed), got $code"; exit 1; }
+          echo "confirmed: ${{ steps.dd.outputs.confirmed }}"
+          test "${{ steps.dd.outputs.confirmed }}" = 3

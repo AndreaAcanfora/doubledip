@@ -26,21 +26,30 @@ import (
 	"github.com/AndreaAcanfora/doubledip/internal/proxy"
 )
 
-// Config holds the options of a hunt.
+// Config holds the options shared by every scenario of a session.
 type Config struct {
 	Upstream       string // postgres:// URL of the development database
 	Listen         string // proxy listen address
 	App            string // shell command that starts the app (optional)
 	Ready          string // URL that answers once the app is up (optional)
 	ReadyTimeout   time.Duration
-	Requests       []string // one or two shell commands, each sending one request
 	BarrierTimeout time.Duration
 	MaxCandidates  int
-	Ignore         []string  // table.column to leave out of comparisons
 	AllowRemote    bool      // allow a database that is not on this machine
 	Log            io.Writer // progress lines
 	AppLog         io.Writer // the app's own output
 	Verbose        bool
+
+	// Requests and Ignore describe a single scenario for Run.
+	Requests []string
+	Ignore   []string
+}
+
+// Scenario is one request (or pair of requests) to race.
+type Scenario struct {
+	Name     string
+	Requests []string // one or two shell commands, each sending one request
+	Ignore   []string // table.column to leave out of comparisons
 }
 
 // Outcome of one candidate.
@@ -61,22 +70,25 @@ type Finding struct {
 	Diff    []dbstate.TableDiff // concurrent state vs the closest serial outcome
 	Outputs [2]RunResult        // what the two concurrent requests printed
 	Serial  [2]RunResult        // what the two serial requests printed
+	Trace   []proxy.Exec        // every statement of the concurrent run
+	Started time.Time           // when the concurrent run started
 	Note    string
 }
 
 // RunResult is the result of one request command.
 type RunResult struct {
-	ExitCode int
-	Output   string
+	ExitCode int    `json:"exit_code"`
+	Output   string `json:"output"`
 }
 
-// Report is the result of a hunt.
+// Report is the result of one scenario.
 type Report struct {
+	Name     string
 	Requests []string
 	Steps    []analyze.Step
 	Findings []Finding
 	Unstable []string // tables that differ between two identical serial runs
-	ProxyURL string
+	Error    string   // set when the scenario could not run
 }
 
 // Confirmed returns the findings that reproduced.
@@ -90,16 +102,34 @@ func (r *Report) Confirmed() []Finding {
 	return out
 }
 
-// Run performs the hunt.
+// Session is a running proxy (and app) with the saved database contents.
+type Session struct {
+	cfg      Config
+	db       *dbstate.DB
+	p        *proxy.Proxy
+	app      *app
+	base     *dbstate.Snapshot
+	ProxyURL string // redacted
+	logf     func(string, ...any)
+}
+
+// Run performs a single-scenario hunt.
 func Run(ctx context.Context, cfg Config) (*Report, error) {
+	s, err := Open(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	defer s.Close()
+	return s.Hunt(ctx, Scenario{Requests: cfg.Requests, Ignore: cfg.Ignore})
+}
+
+// Open starts the proxy and the app and saves the database contents.
+func Open(ctx context.Context, cfg Config) (*Session, error) {
 	if cfg.Log == nil {
 		cfg.Log = io.Discard
 	}
 	if cfg.AppLog == nil {
 		cfg.AppLog = io.Discard
-	}
-	if len(cfg.Requests) == 0 || len(cfg.Requests) > 2 {
-		return nil, errors.New("give one request command, or two to race against each other")
 	}
 	if cfg.BarrierTimeout == 0 {
 		cfg.BarrierTimeout = 3 * time.Second
@@ -110,11 +140,15 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 	if cfg.ReadyTimeout == 0 {
 		cfg.ReadyTimeout = 60 * time.Second
 	}
-	logf := func(format string, a ...any) { fmt.Fprintf(cfg.Log, format+"\n", a...) }
+	if cfg.Listen == "" {
+		cfg.Listen = "127.0.0.1:6543"
+	}
+	s := &Session{cfg: cfg}
+	s.logf = func(format string, a ...any) { fmt.Fprintf(cfg.Log, format+"\n", a...) }
 
 	up, err := url.Parse(cfg.Upstream)
 	if err != nil || (up.Scheme != "postgres" && up.Scheme != "postgresql") {
-		return nil, fmt.Errorf("--db must be a postgres:// URL")
+		return nil, fmt.Errorf("the database must be a postgres:// URL")
 	}
 	host, port := up.Hostname(), up.Port()
 	if host == "" {
@@ -123,85 +157,113 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 	if port == "" {
 		port = "5432"
 	}
-
 	if !cfg.AllowRemote && !isLocal(host) {
 		return nil, fmt.Errorf("%s is not a local database. doubledip empties and refills every table between runs, so it only runs against a development database; pass --allow-remote if %s is one", host, host)
 	}
 
-	db, err := dbstate.Open(ctx, cfg.Upstream)
-	if err != nil {
+	if s.db, err = dbstate.Open(ctx, cfg.Upstream); err != nil {
 		return nil, fmt.Errorf("connect to %s: %w", redact(up), err)
 	}
-	defer db.Close()
-
-	p := &proxy.Proxy{Upstream: net.JoinHostPort(host, port)}
+	s.p = &proxy.Proxy{Upstream: net.JoinHostPort(host, port)}
 	if cfg.Verbose {
-		p.Logf = logf
+		s.p.Logf = s.logf
 	}
-	addr, err := p.Listen(cfg.Listen)
+	addr, err := s.p.Listen(cfg.Listen)
 	if err != nil {
+		s.Close()
 		return nil, fmt.Errorf("proxy: %w", err)
 	}
-	defer p.Close()
 	pu := *up
 	pu.Host = addr
-	rep := &Report{Requests: cfg.Requests, ProxyURL: redact(&pu)}
-	logf("proxy  %s -> %s", addr, p.Upstream)
+	s.ProxyURL = redact(&pu)
+	s.logf("proxy  %s -> %s", addr, s.p.Upstream)
 
 	if cfg.App != "" && cfg.Ready != "" {
 		// Refuse to send requests to whatever already answers there.
-		if ru, err := url.Parse(cfg.Ready); err == nil {
-			hp := ru.Host
-			if ru.Port() == "" {
-				hp = net.JoinHostPort(ru.Hostname(), map[string]string{"https": "443"}[ru.Scheme]+map[bool]string{true: "80"}[ru.Scheme != "https"])
-			}
+		if hp := hostPort(cfg.Ready); hp != "" {
 			if c, err := net.DialTimeout("tcp", hp, time.Second); err == nil {
 				c.Close()
+				s.Close()
 				return nil, fmt.Errorf("something is already listening on %s before the app started: stop it or use another port", hp)
 			}
 		}
 	}
 	if cfg.App != "" {
-		app, err := startApp(cfg.App, pu.String(), addr, cfg.AppLog)
-		if err != nil {
+		if s.app, err = startApp(cfg.App, pu.String(), addr, cfg.AppLog); err != nil {
+			s.Close()
 			return nil, err
 		}
-		defer app.stop()
-		logf("app    %s", cfg.App)
+		s.logf("app    %s", cfg.App)
 	}
 	if cfg.Ready != "" {
-		if err := waitReady(ctx, cfg.Ready, cfg.ReadyTimeout); err != nil {
+		if err := waitReady(ctx, cfg.Ready, cfg.ReadyTimeout, s.app); err != nil {
+			s.Close()
 			return nil, err
 		}
 	} else if cfg.App != "" {
 		time.Sleep(2 * time.Second)
+		if err := s.app.exited(); err != nil {
+			s.Close()
+			return nil, err
+		}
 	}
 
-	base, err := db.Save(ctx)
-	if err != nil {
+	if s.base, err = s.db.Save(ctx); err != nil {
+		s.Close()
 		return nil, fmt.Errorf("save database state: %w", err)
 	}
-	defer func() {
-		if err := db.Restore(context.Background(), base); err != nil {
-			logf("warning: could not restore the database: %v", err)
+	return s, nil
+}
+
+// Close restores the database and stops the app and the proxy.
+func (s *Session) Close() {
+	if s.base != nil {
+		if err := s.db.Restore(context.Background(), s.base); err != nil {
+			s.logf("warning: could not restore the database: %v", err)
 		}
-	}()
+	}
+	if s.app != nil {
+		s.app.stop()
+	}
+	if s.p != nil {
+		s.p.Close()
+	}
+	if s.db != nil {
+		s.db.Close()
+	}
+}
+
+// Hunt races one scenario. The database is back to its saved contents
+// when it returns.
+func (s *Session) Hunt(ctx context.Context, sc Scenario) (*Report, error) {
+	if len(sc.Requests) == 0 || len(sc.Requests) > 2 {
+		return nil, errors.New("give one request command, or two to race against each other")
+	}
+	db, p, base, logf := s.db, s.p, s.base, s.logf
+	defer db.Restore(context.Background(), base)
+	rep := &Report{Name: sc.Name, Requests: sc.Requests}
 	ignore := map[string]bool{}
-	for _, c := range cfg.Ignore {
-		ignore[c] = true
+	for _, c := range sc.Ignore {
+		ignore[strings.TrimSpace(c)] = true
 	}
 	capture := func() (dbstate.State, error) { return db.Capture(ctx, base, ignore) }
-	reqB := cfg.Requests[len(cfg.Requests)-1]
-	reqA := cfg.Requests[0]
+	reqA := sc.Requests[0]
+	reqB := sc.Requests[len(sc.Requests)-1]
+	if sc.Name != "" {
+		logf("scenario %s", sc.Name)
+	}
 
 	// 1. Record one run of the request.
+	if err := db.Restore(ctx, base); err != nil {
+		return nil, err
+	}
 	p.StartRecording()
 	rec := runCmd(ctx, reqA, "record", 1)
 	execs := p.StopRecording()
-	if cfg.Verbose {
+	if s.cfg.Verbose {
 		logf("record exit=%d %s", rec.ExitCode, oneLine(rec.Output))
 	}
-	if len(cfg.Requests) == 2 {
+	if len(sc.Requests) == 2 {
 		if err := db.Restore(ctx, base); err != nil {
 			return nil, err
 		}
@@ -210,7 +272,7 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 		execs = append(execs, p.StopRecording()...)
 	}
 	if len(execs) == 0 {
-		return rep, fmt.Errorf("the request ran no SQL through the proxy: is the app connecting to %s? (exit %d: %s)", rep.ProxyURL, rec.ExitCode, oneLine(rec.Output))
+		return rep, fmt.Errorf("the request ran no SQL through the proxy: is the app connecting to %s? (exit %d: %s)", s.ProxyURL, rec.ExitCode, oneLine(rec.Output))
 	}
 	rep.Steps = analyze.Steps(execs, db.DefaultIsolation(ctx))
 	cands := analyze.Find(rep.Steps)
@@ -255,18 +317,20 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 
 	// 3. Race each candidate.
 	for i, c := range cands {
-		if i >= cfg.MaxCandidates {
+		if i >= s.cfg.MaxCandidates {
 			break
 		}
-		f := Finding{Candidate: c}
+		f := Finding{Candidate: c, Serial: serialOut}
 		if err := db.Restore(ctx, base); err != nil {
 			return nil, err
 		}
-		g := proxy.NewGate(c.GateFP, 2, cfg.BarrierTimeout)
+		g := proxy.NewGate(c.GateFP, 2, s.cfg.BarrierTimeout)
 		p.SetGate(g)
+		p.StartRecording()
+		f.Started = time.Now()
 		f.Outputs = concurrent(ctx, reqA, reqB)
+		f.Trace = p.StopRecording()
 		p.SetGate(nil)
-		f.Serial = serialOut
 		arrived, timedOut := g.Result()
 		f.Arrived = arrived
 		st, err := capture()
@@ -297,7 +361,7 @@ func Run(ctx context.Context, cfg Config) (*Report, error) {
 		default:
 			f.Outcome = NotReached
 		}
-		logf("race   #%d %s at %q: %s", i+1, c.Pattern, short(c.Gate.SQL), f.Outcome)
+		logf("race   #%d %s at %q: %s", i+1, c.Pattern, oneLine(c.Gate.SQL), f.Outcome)
 		rep.Findings = append(rep.Findings, f)
 	}
 	return rep, nil
@@ -352,18 +416,26 @@ func runCmd(ctx context.Context, cmd, phase string, n int) RunResult {
 	return RunResult{ExitCode: code, Output: out}
 }
 
-type app struct{ cmd *exec.Cmd }
+type app struct {
+	cmd  *exec.Cmd
+	done chan struct{}
+	tail *tailBuffer
+}
 
 func startApp(cmdline, dbURL, addr string, log io.Writer) (*app, error) {
 	host, port, _ := net.SplitHostPort(addr)
 	c := exec.Command("sh", "-c", cmdline)
 	c.Env = append(os.Environ(), "DATABASE_URL="+dbURL, "DOUBLEDIP_DATABASE_URL="+dbURL, "PGHOST="+host, "PGPORT="+port)
-	c.Stdout, c.Stderr = log, log
+	tail := &tailBuffer{max: 2000}
+	c.Stdout = io.MultiWriter(log, tail)
+	c.Stderr = c.Stdout
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := c.Start(); err != nil {
 		return nil, fmt.Errorf("start app: %w", err)
 	}
-	return &app{cmd: c}, nil
+	a := &app{cmd: c, done: make(chan struct{}), tail: tail}
+	go func() { c.Wait(); close(a.done) }()
+	return a, nil
 }
 
 func (a *app) stop() {
@@ -371,17 +443,51 @@ func (a *app) stop() {
 		return
 	}
 	syscall.Kill(-a.cmd.Process.Pid, syscall.SIGTERM)
-	done := make(chan struct{})
-	go func() { a.cmd.Wait(); close(done) }()
 	select {
-	case <-done:
+	case <-a.done:
 	case <-time.After(5 * time.Second):
 		syscall.Kill(-a.cmd.Process.Pid, syscall.SIGKILL)
-		<-done
+		<-a.done
 	}
 }
 
-func waitReady(ctx context.Context, u string, timeout time.Duration) error {
+// exited returns an error describing the app's exit if it has stopped.
+func (a *app) exited() error {
+	if a == nil {
+		return nil
+	}
+	select {
+	case <-a.done:
+		return fmt.Errorf("the app exited (%s) before it was ready. Its last output:\n%s", a.cmd.ProcessState, strings.TrimSpace(a.tail.String()))
+	default:
+		return nil
+	}
+}
+
+// tailBuffer keeps the last max bytes written to it.
+type tailBuffer struct {
+	mu  sync.Mutex
+	max int
+	b   []byte
+}
+
+func (t *tailBuffer) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.b = append(t.b, p...)
+	if len(t.b) > t.max {
+		t.b = t.b[len(t.b)-t.max:]
+	}
+	return len(p), nil
+}
+
+func (t *tailBuffer) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return string(t.b)
+}
+
+func waitReady(ctx context.Context, u string, timeout time.Duration, a *app) error {
 	deadline := time.Now().Add(timeout)
 	client := &http.Client{Timeout: 2 * time.Second}
 	for {
@@ -392,6 +498,9 @@ func waitReady(ctx context.Context, u string, timeout time.Duration) error {
 				return nil
 			}
 		}
+		if err := a.exited(); err != nil {
+			return err
+		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("the app did not answer at %s within %s", u, timeout)
 		}
@@ -401,6 +510,20 @@ func waitReady(ctx context.Context, u string, timeout time.Duration) error {
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+}
+
+func hostPort(u string) string {
+	ru, err := url.Parse(u)
+	if err != nil || ru.Host == "" {
+		return ""
+	}
+	if ru.Port() != "" {
+		return ru.Host
+	}
+	if ru.Scheme == "https" {
+		return net.JoinHostPort(ru.Hostname(), "443")
+	}
+	return net.JoinHostPort(ru.Hostname(), "80")
 }
 
 func isLocal(host string) bool {
@@ -426,5 +549,3 @@ func oneLine(s string) string {
 	}
 	return s
 }
-
-func short(s string) string { return oneLine(s) }

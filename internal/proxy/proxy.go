@@ -22,15 +22,16 @@ import (
 
 // Exec is one statement the database finished executing.
 type Exec struct {
-	Seq              int64    // global completion order
-	Conn             int      // proxy connection number
-	Tx               int64    // transaction id; statements of one transaction share it
-	SQL              string   // statement text
-	Params           []string // bind parameters, rendered as text (nil entries become "NULL")
-	Tag              string   // CommandComplete tag, e.g. "UPDATE 1"
-	Err              string   // SQLSTATE and message when the statement failed
-	SessionIsolation string   // session default isolation if the app changed it, else ""
-	At               time.Time
+	Seq              int64     // global completion order
+	Conn             int       // proxy connection number
+	Tx               int64     // transaction id; statements of one transaction share it
+	SQL              string    // statement text
+	Params           []string  // bind parameters, rendered as text (nil entries become "NULL")
+	Tag              string    // CommandComplete tag, e.g. "UPDATE 1"
+	Err              string    // SQLSTATE and message when the statement failed
+	SessionIsolation string    // session default isolation if the app changed it, else ""
+	Start            time.Time // when the app sent it
+	At               time.Time // when the database finished it
 }
 
 // Proxy forwards connections from a listener to an upstream server.
@@ -131,6 +132,7 @@ func (p *Proxy) accept() {
 type pendingExec struct {
 	sql    string
 	params []string
+	start  time.Time
 }
 
 type conn struct {
@@ -216,7 +218,7 @@ func (c *conn) clientToServer(r *bufio.Reader, w io.Writer) {
 			c.noteSession(q)
 			c.mu.Lock()
 			for _, s := range sqlinfo.Split(q) {
-				c.pending = append(c.pending, pendingExec{sql: s})
+				c.pending = append(c.pending, pendingExec{sql: s, start: time.Now()})
 			}
 			c.mu.Unlock()
 			hold = q
@@ -230,7 +232,7 @@ func (c *conn) clientToServer(r *bufio.Reader, w io.Writer) {
 			if b, err := pgwire.DecodeBind(m.Body); err == nil {
 				c.mu.Lock()
 				q := c.stmts[b.Statement]
-				c.portals[b.Portal] = pendingExec{sql: q, params: renderParams(b)}
+				c.portals[b.Portal] = pendingExec{sql: q, params: renderParams(b), start: time.Now()}
 				c.mu.Unlock()
 				c.noteSession(q)
 				hold = q
@@ -335,6 +337,7 @@ func (c *conn) complete(tag, errMsg string) {
 		Tag:              tag,
 		Err:              strings.TrimSpace(errMsg),
 		SessionIsolation: c.iso.Load().(string),
+		Start:            pe.start,
 		At:               time.Now(),
 	})
 }
