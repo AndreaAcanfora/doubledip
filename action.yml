@@ -1,0 +1,80 @@
+name: doubledip
+description: Send the same request twice at the same moment and fail the job when your database ends up in a state no serial run produces.
+author: AndreaAcanfora
+branding:
+  icon: copy
+  color: red
+
+inputs:
+  config:
+    description: Path to the doubledip config file, relative to working-directory.
+    default: doubledip.yml
+  args:
+    description: Extra command-line arguments, e.g. "--only coupon -v".
+    default: ""
+  version:
+    description: Release to use ("latest", "0.2.0", ...), or "source" to build the action's own checkout (needs Go and a C compiler).
+    default: latest
+  working-directory:
+    description: Directory to run doubledip in.
+    default: .
+  fail-on-race:
+    description: Fail the step when a race is confirmed.
+    default: "true"
+
+outputs:
+  confirmed:
+    description: Number of confirmed races.
+    value: ${{ steps.run.outputs.confirmed }}
+  report:
+    description: Path of the JSON report.
+    value: ${{ steps.run.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install doubledip
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        set -euo pipefail
+        bin="$RUNNER_TEMP/doubledip-bin"
+        mkdir -p "$bin"
+        if [ "$VERSION" = source ]; then
+          (cd "$ACTION_PATH" && go build -o "$bin/doubledip" ./cmd/doubledip)
+        else
+          if [ "$VERSION" = latest ]; then
+            tag=$(curl -fsSI https://github.com/AndreaAcanfora/doubledip/releases/latest | tr -d '\r' | sed -n 's#^[Ll]ocation: .*/tag/##p')
+            VERSION=${tag#v}
+          fi
+          VERSION=${VERSION#v}
+          case "$RUNNER_OS" in Linux) os=linux ;; macOS) os=darwin ;; *) echo "doubledip runs on Linux and macOS runners" >&2; exit 1 ;; esac
+          case "$RUNNER_ARCH" in X64) arch=amd64 ;; ARM64) arch=arm64 ;; *) echo "unsupported runner architecture $RUNNER_ARCH" >&2; exit 1 ;; esac
+          name="doubledip_${VERSION}_${os}_${arch}"
+          curl -fsSL "https://github.com/AndreaAcanfora/doubledip/releases/download/v${VERSION}/${name}.tar.gz" | tar -xz -C "$RUNNER_TEMP"
+          mv "$RUNNER_TEMP/$name/doubledip" "$bin/doubledip"
+        fi
+        echo "$bin" >> "$GITHUB_PATH"
+        "$bin/doubledip" -version
+
+    - name: Run doubledip
+      id: run
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CONFIG: ${{ inputs.config }}
+        ARGS: ${{ inputs.args }}
+        FAIL: ${{ inputs.fail-on-race }}
+      run: |
+        set +e -uo pipefail
+        report="$RUNNER_TEMP/doubledip-report.json"
+        # ARGS is split on spaces on purpose: it holds extra flags.
+        doubledip --config "$CONFIG" --markdown "$GITHUB_STEP_SUMMARY" --report "$report" $ARGS
+        code=$?
+        echo "report=$report" >> "$GITHUB_OUTPUT"
+        confirmed=$(sed -n 's/^  "confirmed": \([0-9]*\),$/\1/p' "$report" 2>/dev/null | head -1)
+        echo "confirmed=${confirmed:-0}" >> "$GITHUB_OUTPUT"
+        if [ "$code" = 1 ] && [ "$FAIL" != true ]; then exit 0; fi
+        exit $code

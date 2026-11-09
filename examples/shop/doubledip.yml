@@ -1,0 +1,18 @@
+# doubledip --config examples/shop/doubledip.yml
+# Checks every endpoint of the example shop in one run.
+db: ${SHOP_DB}
+app: go run ./examples/shop
+ready: http://localhost:8080/health
+scenarios:
+  - name: redeem a single-use coupon
+    request: curl -sS -X POST "localhost:8080/redeem?code=WELCOME&user=u$DOUBLEDIP_N"
+  - name: redeem a single-use coupon (FOR UPDATE)
+    request: curl -sS -X POST "localhost:8080/redeem-safe?code=SAFE&user=u$DOUBLEDIP_N"
+  - name: withdraw 80 from 100
+    request: curl -sS -X POST "localhost:8080/withdraw?account=1&amount=80"
+  - name: withdraw 80 from 100 (guarded UPDATE)
+    request: curl -sS -X POST "localhost:8080/withdraw-safe?account=2&amount=80"
+  - name: sign up with the same email
+    request: curl -sS -X POST "localhost:8080/signup?email=ada@example.com"
+  - name: sign up with the same email (unique index)
+    request: curl -sS -X POST "localhost:8080/signup-safe?email=ada@example.com"
