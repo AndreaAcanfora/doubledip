@@ -20,6 +20,8 @@ type fileConfig struct {
 	Listen         string         `yaml:"listen"`
 	BarrierTimeout time.Duration  `yaml:"barrier_timeout"`
 	Max            int            `yaml:"max"`
+	FreeRuns       *int           `yaml:"free_runs"`
+	RestartApp     bool           `yaml:"restart_app"`
 	AllowRemote    bool           `yaml:"allow_remote"`
 	Scenarios      []fileScenario `yaml:"scenarios"`
 }

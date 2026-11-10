@@ -499,6 +499,16 @@ func (g *Gate) Release() {
 	g.mu.Unlock()
 }
 
+// Waiting returns how many connections are held at the barrier now.
+func (g *Gate) Waiting() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.released {
+		return 0
+	}
+	return len(g.arrived)
+}
+
 // Result reports how many connections reached the barrier and whether it
 // opened because of the timeout.
 func (g *Gate) Result() (arrived int, timedOut bool) {

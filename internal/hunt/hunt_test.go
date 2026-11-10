@@ -142,6 +142,19 @@ func TestShopGo(t *testing.T) {
 			check(t, rep, c)
 			// The concurrent run is traced, with the held statements marked.
 			f := rep.Findings[0]
+			switch f.Outcome {
+			case Confirmed:
+				// Confirmed races are run again without the barrier.
+				if f.FreeRuns == 0 {
+					t.Errorf("confirmed race not run freely: %+v", f)
+				}
+			case NotReached:
+				// The second request waits on the first's row lock: the
+				// barrier opens without waiting for its timeout.
+				if !f.Blocked {
+					t.Errorf("lock wait not noticed")
+				}
+			}
 			if len(f.Trace) < 2 || f.Started.IsZero() {
 				t.Fatalf("no trace: %+v", f.Trace)
 			}
@@ -210,5 +223,33 @@ func TestRestoresDatabase(t *testing.T) {
 	conn.QueryRow(context.Background(), "SELECT count(*) FROM ledger").Scan(&ledger)
 	if balance != 100 || ledger != 0 {
 		t.Fatalf("balance %d, ledger rows %d: not restored", balance, ledger)
+	}
+}
+
+// With RestartApp the app is started again after every restore, and the
+// hunt still works.
+func TestRestartApp(t *testing.T) {
+	db := testDB(t)
+	bin := filepath.Join(t.TempDir(), "shop")
+	build := exec.Command("go", "build", "-o", bin, "./examples/shop")
+	build.Dir = repoRoot()
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	addr := freePort(t)
+	t.Setenv("ADDR", addr)
+	var log strings.Builder
+	rep, err := Run(context.Background(), Config{
+		Upstream: db, Listen: "127.0.0.1:0", App: bin, Ready: "http://" + addr + "/health",
+		Requests:       []string{fmt.Sprintf(`curl -sS -X POST "http://%s/withdraw?account=1&amount=80"`, addr)},
+		BarrierTimeout: 2 * time.Second, RestartApp: true, AppLog: &log,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	check(t, rep, tcase{"withdraw", Confirmed})
+	// record, three serial runs, one race and its free runs, plus the first start
+	if n := strings.Count(log.String(), "listening"); n < 6 {
+		t.Errorf("app started %d times:\n%s", n, log.String())
 	}
 }

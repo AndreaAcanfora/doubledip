@@ -6,6 +6,7 @@ package analyze
 
 import (
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -81,40 +82,77 @@ func Steps(execs []proxy.Exec, defaultIso string) []Step {
 }
 
 // Find returns the candidate races in one request, at most one per gate
-// statement, in the order the request ran them.
+// statement, most likely races first: the ones nothing rules out, then lost
+// updates, check-then-act and check-then-insert.
+//
+// An app can run one request on several pooled connections at once, and
+// their statements interleave differently on every run. So the gate and the
+// write are looked up on one connection, not in the global order: the write
+// is the first write to a table the read looked at, preferably on the
+// read's own connection, and the gate is the first write on the write's
+// connection after the read. That keeps the same candidates from one
+// recording to the next.
 func Find(steps []Step) []Candidate {
 	var out []Candidate
-	seen := map[string]bool{}
+	byGate := map[string]int{}
 	for i, r := range steps {
 		if r.Stmt.Kind != sqlinfo.Select || r.Err != "" || len(r.Stmt.Reads) == 0 {
 			continue
 		}
-		gate := -1
-		for j := i + 1; j < len(steps); j++ {
-			if steps[j].Stmt.Writes() && steps[j].Err == "" {
+		w := -1
+		for _, sameConn := range []bool{true, false} {
+			for j := i + 1; j < len(steps) && w < 0; j++ {
+				s := steps[j]
+				if (s.Conn == r.Conn) == sameConn && s.Stmt.Writes() && s.Err == "" && contains(r.Stmt.Reads, s.Stmt.Target) && affected(s.Tag) != 0 {
+					w = j
+				}
+			}
+			if w >= 0 {
+				break
+			}
+		}
+		if w < 0 {
+			continue
+		}
+		gate := w
+		for j := i + 1; j < w; j++ {
+			if steps[j].Conn == steps[w].Conn && steps[j].Stmt.Writes() && steps[j].Err == "" {
 				gate = j
 				break
 			}
 		}
-		if gate < 0 {
+		fp, err := sqlinfo.Fingerprint(steps[gate].SQL)
+		if err != nil {
 			continue
 		}
-		for j := gate; j < len(steps); j++ {
-			w := steps[j]
-			if !w.Stmt.Writes() || w.Err != "" || !contains(r.Stmt.Reads, w.Stmt.Target) || affected(w.Tag) == 0 {
-				continue
+		c := classify(r, steps[w])
+		c.Gate, c.GateFP = steps[gate], fp
+		// Racing at the same gate tests the same thing: keep the candidate
+		// that nothing rules out.
+		if k, ok := byGate[fp]; ok {
+			if out[k].Safe && !c.Safe {
+				out[k] = c
 			}
-			fp, err := sqlinfo.Fingerprint(steps[gate].SQL)
-			if err != nil || seen[fp] {
-				break
-			}
-			seen[fp] = true
-			c := classify(r, w)
-			c.Gate, c.GateFP = steps[gate], fp
-			out = append(out, c)
-			break
+			continue
 		}
+		byGate[fp] = len(out)
+		out = append(out, c)
 	}
+	// The order decides which candidates --max leaves out, so it must not
+	// depend on the interleaving either.
+	rank := map[Pattern]int{LostUpdate: 0, CheckThenAct: 1, CheckThenWrite: 2}
+	sort.SliceStable(out, func(a, b int) bool {
+		x, y := out[a], out[b]
+		switch {
+		case x.Safe != y.Safe:
+			return !x.Safe
+		case rank[x.Pattern] != rank[y.Pattern]:
+			return rank[x.Pattern] < rank[y.Pattern]
+		case x.Write.Stmt.Target != y.Write.Stmt.Target:
+			return x.Write.Stmt.Target < y.Write.Stmt.Target
+		}
+		return x.GateFP < y.GateFP
+	})
 	return out
 }
 
@@ -151,13 +189,14 @@ func classify(r, w Step) Candidate {
 				fmt.Sprintf("or read the row with SELECT ... FOR UPDATE in the same transaction as the UPDATE of %s", t))
 		default:
 			c.Pattern = CheckThenAct
-			col := first(w.Stmt.Relative)
-			if col == "" {
-				col = first(w.Stmt.WhereCols)
+			// Only a column the write does arithmetic on is a quantity to
+			// compare; a key such as id or token is not.
+			if col := first(w.Stmt.Relative); col != "" {
+				c.Fix = append(c.Fix, fmt.Sprintf("put the check in the write's WHERE clause (e.g. WHERE ... AND %s >= $amount) and treat 0 rows as \"rejected\"", col))
+			} else {
+				c.Fix = append(c.Fix, fmt.Sprintf("repeat the condition the SELECT checked in the WHERE clause of the %s and treat 0 rows as \"rejected\"", strings.ToUpper(string(w.Stmt.Kind))))
 			}
-			c.Fix = append(c.Fix,
-				fmt.Sprintf("put the check in the write's WHERE clause (e.g. WHERE ... AND %s >= $amount) and treat 0 rows as \"rejected\"", col),
-				fmt.Sprintf("or read with SELECT ... FOR UPDATE in the same transaction as the write to %s", t))
+			c.Fix = append(c.Fix, fmt.Sprintf("or read with SELECT ... FOR UPDATE in the same transaction as the write to %s", t))
 		}
 		if guarded && w.Stmt.Kind == sqlinfo.Update {
 			c.Safe, c.Why = true, fmt.Sprintf("the UPDATE re-checks %s in its own WHERE clause", strings.Join(w.Stmt.Relative, ", "))

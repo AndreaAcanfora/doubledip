@@ -1,6 +1,7 @@
 package analyze
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/AndreaAcanfora/doubledip/internal/proxy"
@@ -135,5 +136,80 @@ func TestOneCandidatePerGate(t *testing.T) {
 	), ""))
 	if len(c) != 1 {
 		t.Fatalf("got %d candidates, want 1 (same gate)", len(c))
+	}
+}
+
+// conns builds a recorded request from (conn, tx, sql, tag) quadruples.
+func conns(stmts ...any) []proxy.Exec {
+	var out []proxy.Exec
+	for i := 0; i < len(stmts); i += 4 {
+		out = append(out, proxy.Exec{Seq: int64(i/4 + 1), Conn: stmts[i].(int), Tx: int64(stmts[i+1].(int)), SQL: stmts[i+2].(string), Tag: stmts[i+3].(string)})
+	}
+	return out
+}
+
+func summary(cs []Candidate) []string {
+	var out []string
+	for _, c := range cs {
+		out = append(out, c.Read.Stmt.Reads[0]+"->"+c.Write.Stmt.Target+"@"+c.Gate.Stmt.Target)
+	}
+	return out
+}
+
+// One request runs two steps in parallel on two pooled connections. Whatever
+// way their statements interleave, the candidates are the same.
+func TestParallelConnectionsGiveStableCandidates(t *testing.T) {
+	stock := []any{
+		1, 1, "SELECT reserved, stocked FROM inventory_level WHERE item_id = $1", "SELECT 1",
+		1, 1, "UPDATE inventory_level SET reserved = $1 WHERE item_id = $2", "UPDATE 1",
+	}
+	order := []any{
+		2, 2, "SELECT id FROM carts WHERE id = $1", "SELECT 1",
+		2, 2, "INSERT INTO orders (cart_id) VALUES ($1)", "INSERT 0 1",
+		2, 2, "UPDATE carts SET completed_at = now() WHERE id = $1", "UPDATE 1",
+	}
+	a := append(append([]any{}, stock...), order...)
+	b := append(append([]any{}, order[:4]...), stock[:4]...)
+	b = append(b, order[4:]...)
+	b = append(b, stock[4:]...)
+	ca, cb := summary(Find(Steps(conns(a...), ""))), summary(Find(Steps(conns(b...), "")))
+	if len(ca) != 2 || strings.Join(ca, " ") != strings.Join(cb, " ") {
+		t.Fatalf("candidates depend on the interleaving:\n%v\n%v", ca, cb)
+	}
+	for _, s := range ca {
+		if s == "inventory_level->inventory_level@orders" {
+			t.Fatalf("gate taken from another connection: %v", ca)
+		}
+	}
+}
+
+// Two reads that share a gate are one test: the one nothing rules out is
+// kept, and candidates that are not safe come first.
+func TestSharedGateKeepsUnsafeCandidate(t *testing.T) {
+	c := Find(Steps(run(
+		1, "BEGIN", "BEGIN",
+		1, "SELECT uses FROM coupons WHERE id = 1 FOR UPDATE", "SELECT 1",
+		1, "SELECT balance FROM accounts WHERE id = 1", "SELECT 1",
+		1, "UPDATE coupons SET uses = 1 WHERE id = 1", "UPDATE 1",
+		1, "UPDATE accounts SET balance = 0 WHERE id = 1", "UPDATE 1",
+		1, "COMMIT", "COMMIT",
+	), ""))
+	if len(c) != 1 || c[0].Safe || c[0].Write.Stmt.Target != "accounts" {
+		t.Fatalf("%v", summary(c))
+	}
+}
+
+func TestCheckThenDeleteHintHasNoAmount(t *testing.T) {
+	c := Find(Steps(run(
+		1, "SELECT token FROM checkouts WHERE token = $1", "SELECT 1",
+		2, "DELETE FROM checkouts WHERE token IN ($1)", "DELETE 1",
+	), ""))
+	if len(c) != 1 || c[0].Pattern != CheckThenAct {
+		t.Fatalf("%+v", c)
+	}
+	for _, f := range c[0].Fix {
+		if strings.Contains(f, "$amount") {
+			t.Fatalf("hint compares a key with an amount: %q", f)
+		}
 	}
 }

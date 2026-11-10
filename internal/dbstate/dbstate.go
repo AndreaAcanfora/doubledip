@@ -71,6 +71,17 @@ func (d *DB) DefaultIsolation(ctx context.Context) string {
 	return s
 }
 
+// LockWaiters returns how many other sessions of this database are waiting
+// for a lock held by another session.
+func (d *DB) LockWaiters(ctx context.Context) (int, error) {
+	var n int
+	err := d.conn.QueryRow(ctx, `
+		SELECT count(*) FROM pg_stat_activity
+		WHERE datname = current_database() AND pid <> pg_backend_pid()
+		  AND cardinality(pg_blocking_pids(pid)) > 0`).Scan(&n)
+	return n, err
+}
+
 // UniqueIndexes returns, for each table key, the column lists of its unique
 // indexes and constraints (primary keys included).
 func (d *DB) UniqueIndexes(ctx context.Context) (map[string][][]string, error) {
