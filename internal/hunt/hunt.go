@@ -316,6 +316,11 @@ func (s *Session) Hunt(ctx context.Context, sc Scenario) (*Report, error) {
 	rep.Steps = analyze.Steps(execs, db.DefaultIsolation(ctx))
 	cands := analyze.Find(rep.Steps)
 	logf("record %d statements, %d candidate race(s)", len(execs), len(cands))
+	if s.cfg.Verbose {
+		for i, c := range cands {
+			logf("cand   #%d %s on %s, read %s, held at %q", i+1, c.Pattern, c.Write.Stmt.Target, strings.Join(c.Read.Stmt.Reads, ","), oneLine(c.Gate.SQL))
+		}
+	}
 	if len(cands) == 0 {
 		return rep, nil
 	}
