@@ -93,7 +93,9 @@ Exit status: `0` nothing reproduced, `1` race confirmed, `2` error. It works in 
 | `--config` | `doubledip.yml` if present | run the scenarios of a config file |
 | `--only` | | run only the scenarios whose name contains this text |
 | `--barrier-timeout` | `3s` | how long the first request waits at the write for the second |
-| `--max` | `8` | candidate races to test per scenario |
+| `--max` | `8` | candidate races to test per scenario; the report says how many were left out |
+| `--free-runs` | `3` | times to send a confirmed race again without the barrier (`0` skips it) |
+| `--restart-app` | | restart the app after every restore, for apps that keep database rows in memory |
 | `--ignore` | | `table.column` list left out of comparisons |
 | `--json` | | print the report as JSON instead of text |
 | `--report` | | also write the JSON report to a file |
@@ -115,6 +117,8 @@ db: ${DATABASE_URL}
 app: npm start
 ready: http://localhost:3000/health
 barrier_timeout: 3s
+# free_runs: 3
+# restart_app: true
 scenarios:
   - name: redeem a coupon
     request: curl -sS -X POST "localhost:3000/coupons/WELCOME/redeem?user=u$DOUBLEDIP_N"
@@ -166,22 +170,36 @@ Inputs: `config`, `args` (extra flags), `version` (`latest` by default),
    statement, its parameters, its transaction and its isolation level.
 2. **Find.** For every `SELECT` followed by an `INSERT`, `UPDATE` or `DELETE` on a
    table it read, it marks the first write after that read as the place to hold
-   the requests. Statements are parsed with libpg_query, so ORMs' SQL is fine.
+   the requests. It follows each database connection on its own, so an app that
+   runs one request on several pooled connections at once gets the same
+   candidates on every run. Statements are parsed with libpg_query, so ORMs' SQL
+   is fine.
 3. **Serial runs.** The two requests run one after the other, in both orders, from
    the same starting data. Those are the correct outcomes. A repeated run spots
    tables that change on their own; those are left out.
 4. **Race.** From the same starting data, both requests start together. The proxy
    holds the first one to reach the write (matched by query fingerprint) until the
-   second gets there, then lets both go.
+   second gets there, then lets both go. If the second is stuck behind a lock the
+   first one holds, it lets the first go at once instead of waiting for the timeout.
 5. **Compare.** If the database now holds anything the serial runs never produce,
    the race is confirmed. Generated ids, sequence values, timestamps and random
    defaults are ignored.
+6. **Check without the barrier.** A confirmed race is sent again a few times with
+   nothing held, the way real clients would. The report says whether it came back.
+   If every one of those runs ends with Postgres aborting a request on a deadlock,
+   the race is reported as **blocked by a deadlock** instead: the barrier forced an
+   order that real traffic cannot reach.
 
 | outcome | meaning |
 |---|---|
 | **confirmed** | both requests got past the check; the data shows it |
 | **safe** | both were held at the write, and the result still matched a serial run (a guarded `UPDATE`, a unique index, `SERIALIZABLE`) |
 | **serialized** | the second request could not reach the write while the first waited there (a row lock such as `FOR UPDATE`) |
+| **blocked by a deadlock** | reproduced only while held; sent freely, Postgres always aborted one of the requests (`40P01`) |
+
+Several candidates of one request often hit the same race from different
+statements. When two confirmed findings leave the database in exactly the same
+state, the second is reported as "same as #N" and counted once.
 
 doubledip reports three patterns: **lost update** (read a value, write a new one
 computed in the app), **check-then-act** (check a value, then change it relative to
@@ -199,7 +217,9 @@ exist, then create it).
 - It restores data through `TRUNCATE` and `INSERT`, as fast as your dev database
   is small. With a superuser it also skips triggers and foreign key checks while
   restoring.
-- In-memory caches in your app are not reset between runs.
+- In-memory caches in your app are not reset between runs unless you pass
+  `--restart-app`, which restarts it after every restore (slower, but a cached
+  counter can otherwise hide a race).
 
 ## Prior art
 

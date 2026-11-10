@@ -32,14 +32,22 @@ func (r *Report) Text(w io.Writer, color bool) {
 		fmt.Fprintf(w, "\n%s✓ nothing to race%s: no write follows a read of the same table.\n", green, reset)
 		return
 	}
-	for _, f := range r.Findings {
+	for i, f := range r.Findings {
 		fmt.Fprintln(w)
-		switch f.Outcome {
-		case Confirmed:
-			fmt.Fprintf(w, "%s%s✗ RACE CONFIRMED%s  %s on %s\n", bold, red, reset, f.Pattern, f.Write.Stmt.Target)
-		case Held:
+		switch {
+		case f.SameAs > 0:
+			mark, c := "✗", red
+			if f.Outcome != Confirmed {
+				mark, c = "~", yellow
+			}
+			fmt.Fprintf(w, "%s%s same as #%d%s  %s on %s: the database ended in the same state\n", c, mark, f.SameAs, reset, f.Pattern, f.Write.Stmt.Target)
+		case f.Outcome == Confirmed:
+			fmt.Fprintf(w, "%s%s✗ RACE CONFIRMED #%d%s  %s on %s\n", bold, red, i+1, reset, f.Pattern, f.Write.Stmt.Target)
+		case f.Outcome == Deadlock:
+			fmt.Fprintf(w, "%s~ blocked by a deadlock%s  %s on %s: held at the write the two requests overlapped, but sent freely %s the database aborted one of them (40P01)\n", yellow, reset, f.Pattern, f.Write.Stmt.Target, times(f.FreeRuns))
+		case f.Outcome == Held:
 			fmt.Fprintf(w, "%s✓ safe%s  %s on %s: both requests were held at the write and the result matched a serial run\n", green, reset, f.Pattern, f.Write.Stmt.Target)
-		case NotReached:
+		case f.Outcome == NotReached:
 			fmt.Fprintf(w, "%s✓ serialized%s  %s on %s: the second request could not reach the write while the first waited (a lock or an earlier check stopped it)\n", green, reset, f.Pattern, f.Write.Stmt.Target)
 		default:
 			fmt.Fprintf(w, "%s? inconclusive%s  %s on %s: %s\n", yellow, reset, f.Pattern, f.Write.Stmt.Target, f.Note)
@@ -56,13 +64,22 @@ func (r *Report) Text(w io.Writer, color bool) {
 		if f.Gate.Seq != f.Write.Seq {
 			step("held", f.Gate)
 		}
-		if f.Outcome != Confirmed {
+		if f.Outcome != Confirmed || f.SameAs > 0 {
 			if f.Safe && f.Why != "" {
 				fmt.Fprintf(w, "  %swhy: %s%s\n", dim, f.Why, reset)
+			}
+			if f.Blocked {
+				fmt.Fprintf(w, "  %sthe second request waited on a lock held by the first%s\n", dim, reset)
 			}
 			continue
 		}
 		fmt.Fprintf(w, "  %sboth requests read, then both wrote: %d of 2 reached the write and were held there%s\n", dim, f.Arrived, reset)
+		switch {
+		case f.FreeHits > 0:
+			fmt.Fprintf(w, "  %salso reproduced without the barrier, on free run %d%s\n", dim, f.FreeRuns, reset)
+		case f.FreeRuns > 0:
+			fmt.Fprintf(w, "  %snot reproduced in %s without the barrier: it may need tight timing%s\n", yellow, times(f.FreeRuns), reset)
+		}
 		fmt.Fprintf(w, "  one after the other  %s\n", results(f.Serial))
 		fmt.Fprintf(w, "  at the same time     %s\n", results(f.Outputs))
 		fmt.Fprintf(w, "  database, serial vs concurrent:\n")
@@ -90,6 +107,9 @@ func (r *Report) Text(w io.Writer, color bool) {
 			}
 			fmt.Fprintf(w, "  %s%s%s  %s\n", yellow, label, reset, fix)
 		}
+	}
+	if r.Untested > 0 {
+		fmt.Fprintf(w, "\n%s! %s not tested%s: raise --max to test them\n", yellow, plural(r.Untested, "more candidate"), reset)
 	}
 	if len(r.Unstable) > 0 {
 		fmt.Fprintf(w, "\n%snot compared (they change between identical runs): %s%s\n", dim, strings.Join(r.Unstable, ", "), reset)
@@ -134,6 +154,13 @@ func results(r [2]RunResult) string {
 
 func rows(n int) string { return plural(n, "row") }
 
+func times(n int) string {
+	if n == 1 {
+		return "once"
+	}
+	return fmt.Sprintf("%d times", n)
+}
+
 func plural(n int, word string) string {
 	if n == 1 {
 		return "1 " + word
@@ -151,6 +178,7 @@ func clip(s string, n int) string {
 // JSON types. They are the stable, documented output of --json.
 
 type jsonStep struct {
+	Conn      int      `json:"conn"`
 	Tx        int      `json:"tx"`
 	SQL       string   `json:"sql"`
 	Params    []string `json:"params,omitempty"`
@@ -190,6 +218,11 @@ type jsonFinding struct {
 	Diff       []jsonDiff   `json:"diff,omitempty"`
 	Fix        []string     `json:"fix,omitempty"`
 	Why        string       `json:"why,omitempty"`
+	SameAs     int          `json:"same_as,omitempty"`
+	Blocked    bool         `json:"blocked_on_lock,omitempty"`
+	FreeRuns   int          `json:"free_runs,omitempty"`
+	FreeHits   int          `json:"free_hits,omitempty"`
+	Deadlocks  int          `json:"free_deadlocks,omitempty"`
 	Serial     [2]RunResult `json:"serial"`
 	Concurrent [2]RunResult `json:"concurrent"`
 	Trace      []jsonTrace  `json:"trace"`
@@ -203,21 +236,22 @@ type jsonReport struct {
 	Findings   []jsonFinding `json:"findings"`
 	Confirmed  int           `json:"confirmed"`
 	Unstable   []string      `json:"unstable_tables,omitempty"`
+	Untested   int           `json:"untested,omitempty"`
 }
 
 func (r *Report) toJSON() jsonReport {
 	conv := func(s analyze.Step) jsonStep {
-		return jsonStep{Tx: s.TxIndex, SQL: s.SQL, Params: s.Params, Tag: s.Tag, Error: s.Err, Isolation: s.Isolation}
+		return jsonStep{Conn: s.Conn, Tx: s.TxIndex, SQL: s.SQL, Params: s.Params, Tag: s.Tag, Error: s.Err, Isolation: s.Isolation}
 	}
 	out := jsonReport{Name: r.Name, Requests: r.Requests, Error: r.Error, Confirmed: len(r.Confirmed()),
-		Unstable: r.Unstable, Statements: []jsonStep{}, Findings: []jsonFinding{}}
+		Unstable: r.Unstable, Untested: r.Untested, Statements: []jsonStep{}, Findings: []jsonFinding{}}
 	for _, s := range r.Steps {
 		out.Statements = append(out.Statements, conv(s))
 	}
 	for _, f := range r.Findings {
 		fd := jsonFinding{Outcome: f.Outcome, Pattern: string(f.Pattern), Table: f.Write.Stmt.Target,
 			Read: conv(f.Read), Write: conv(f.Write), Held: conv(f.Gate), Arrived: f.Arrived,
-			Fix: f.Fix, Why: f.Why, Concurrent: f.Outputs, Serial: f.Serial, Trace: []jsonTrace{}}
+			Fix: f.Fix, Why: f.Why, SameAs: f.SameAs, Blocked: f.Blocked, FreeRuns: f.FreeRuns, FreeHits: f.FreeHits, Deadlocks: f.FreeDeadlocks, Concurrent: f.Outputs, Serial: f.Serial, Trace: []jsonTrace{}}
 		for _, d := range f.Diff {
 			fd.Diff = append(fd.Diff, jsonDiff{Table: d.Table, Serial: d.Count[0], Concurrent: d.Count[1], OnlySerial: d.OnlyA, OnlyConcurrent: d.OnlyB})
 		}
@@ -276,7 +310,10 @@ func WriteMarkdown(w io.Writer, reps []*Report) {
 			fmt.Fprintf(w, "| %s | ✅ nothing to race | | |\n", mdCell(name))
 		}
 		for _, f := range r.Findings {
-			icon := map[Outcome]string{Confirmed: "❌ race confirmed", Held: "✅ safe", NotReached: "✅ serialized", Inconclusive: "⚠️ inconclusive"}[f.Outcome]
+			icon := map[Outcome]string{Confirmed: "❌ race confirmed", Held: "✅ safe", NotReached: "✅ serialized", Inconclusive: "⚠️ inconclusive", Deadlock: "⚠️ blocked by a deadlock"}[f.Outcome]
+			if f.SameAs > 0 {
+				icon += fmt.Sprintf(" (same as #%d)", f.SameAs)
+			}
 			fmt.Fprintf(w, "| %s | %s | %s | `%s` |\n", mdCell(name), icon, f.Pattern, f.Write.Stmt.Target)
 		}
 	}

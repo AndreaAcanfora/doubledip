@@ -61,6 +61,8 @@ func run() int {
 	ready := fs.String("ready", "", "URL to poll until the app answers before starting")
 	barrier := fs.Duration("barrier-timeout", 3*time.Second, "how long to hold the first request waiting for the second")
 	maxC := fs.Int("max", 8, "maximum number of candidate races to test per scenario")
+	freeRuns := fs.Int("free-runs", 3, "times to run a confirmed race again without the barrier (0 skips it)")
+	restartApp := fs.Bool("restart-app", false, "restart the app after every database restore (for apps that cache database rows in memory)")
 	ignore := fs.String("ignore", "", "comma-separated table.column list to leave out of comparisons")
 	allowRemote := fs.Bool("allow-remote", false, "allow a database that is not on localhost (it must still be a disposable one)")
 	jsonOut := fs.Bool("json", false, "print the report as JSON")
@@ -77,7 +79,7 @@ func run() int {
 	set := map[string]bool{}
 	fs.Visit(func(f *flag.Flag) { set[f.Name] = true })
 
-	cfg := hunt.Config{Listen: *listen, BarrierTimeout: *barrier, MaxCandidates: *maxC, Verbose: *verbose}
+	cfg := hunt.Config{Listen: *listen, BarrierTimeout: *barrier, MaxCandidates: *maxC, FreeRuns: *freeRuns, RestartApp: *restartApp, Verbose: *verbose}
 	var scenarios []hunt.Scenario
 	if *configPath == "" && fs.NArg() == 0 {
 		if _, err := os.Stat("doubledip.yml"); err == nil {
@@ -99,6 +101,12 @@ func run() int {
 		}
 		if fc.Max != 0 && !set["max"] {
 			cfg.MaxCandidates = fc.Max
+		}
+		if fc.FreeRuns != nil && !set["free-runs"] {
+			cfg.FreeRuns = *fc.FreeRuns
+		}
+		if fc.RestartApp && !set["restart-app"] {
+			cfg.RestartApp = true
 		}
 		if fs.NArg() == 0 {
 			for _, s := range fc.Scenarios {
@@ -123,6 +131,13 @@ func run() int {
 	}
 	if set["allow-remote"] {
 		cfg.AllowRemote = *allowRemote
+	}
+	if cfg.FreeRuns == 0 {
+		cfg.FreeRuns = -1
+	}
+	if cfg.RestartApp && cfg.App == "" {
+		fmt.Fprintln(os.Stderr, "doubledip: --restart-app needs --app")
+		return 2
 	}
 	if fs.NArg() > 0 {
 		var ign []string

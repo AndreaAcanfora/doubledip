@@ -35,6 +35,8 @@ type Config struct {
 	ReadyTimeout   time.Duration
 	BarrierTimeout time.Duration
 	MaxCandidates  int
+	FreeRuns       int       // times a confirmed race is run again without the barrier; <0 skips it
+	RestartApp     bool      // restart the app after every database restore
 	AllowRemote    bool      // allow a database that is not on this machine
 	Log            io.Writer // progress lines
 	AppLog         io.Writer // the app's own output
@@ -60,6 +62,7 @@ const (
 	Held         Outcome = "safe"         // both requests were held at the write, result matched a serial run
 	NotReached   Outcome = "serialized"   // the second request never reached the write in time
 	Inconclusive Outcome = "inconclusive" // something failed while testing
+	Deadlock     Outcome = "deadlock"     // reproduced only while held; run freely, the database aborts one request
 )
 
 // Finding is a candidate with the result of testing it.
@@ -73,6 +76,16 @@ type Finding struct {
 	Trace   []proxy.Exec        // every statement of the concurrent run
 	Started time.Time           // when the concurrent run started
 	Note    string
+	// Blocked is set when the second request waited on a lock held by the
+	// first, so the barrier opened without waiting for the timeout.
+	Blocked bool
+	// FreeRuns is how many times a confirmed race was run again without the
+	// barrier; FreeHits how many of those runs reproduced it and
+	// FreeDeadlocks how many ended with a deadlock (40P01).
+	FreeRuns, FreeHits, FreeDeadlocks int
+	// SameAs is the 1-based index of an earlier finding that left exactly
+	// the same database state: the same race seen from another statement.
+	SameAs int
 }
 
 // RunResult is the result of one request command.
@@ -88,14 +101,16 @@ type Report struct {
 	Steps    []analyze.Step
 	Findings []Finding
 	Unstable []string // tables that differ between two identical serial runs
+	Untested int      // candidates left out by MaxCandidates
 	Error    string   // set when the scenario could not run
 }
 
-// Confirmed returns the findings that reproduced.
+// Confirmed returns the races that reproduced, each once: a finding with
+// the same result as an earlier one is left out.
 func (r *Report) Confirmed() []Finding {
 	var out []Finding
 	for _, f := range r.Findings {
-		if f.Outcome == Confirmed {
+		if f.Outcome == Confirmed && f.SameAs == 0 {
 			out = append(out, f)
 		}
 	}
@@ -111,6 +126,8 @@ type Session struct {
 	base     *dbstate.Snapshot
 	ProxyURL string // redacted
 	logf     func(string, ...any)
+	appURL   string // DATABASE_URL given to the app
+	appAddr  string
 }
 
 // Run performs a single-scenario hunt.
@@ -136,6 +153,9 @@ func Open(ctx context.Context, cfg Config) (*Session, error) {
 	}
 	if cfg.MaxCandidates == 0 {
 		cfg.MaxCandidates = 8
+	}
+	if cfg.FreeRuns == 0 {
+		cfg.FreeRuns = 3
 	}
 	if cfg.ReadyTimeout == 0 {
 		cfg.ReadyTimeout = 60 * time.Second
@@ -188,24 +208,13 @@ func Open(ctx context.Context, cfg Config) (*Session, error) {
 			}
 		}
 	}
+	s.appURL, s.appAddr = pu.String(), addr
 	if cfg.App != "" {
-		if s.app, err = startApp(cfg.App, pu.String(), addr, cfg.AppLog); err != nil {
+		if err := s.startApp(ctx); err != nil {
 			s.Close()
 			return nil, err
 		}
 		s.logf("app    %s", cfg.App)
-	}
-	if cfg.Ready != "" {
-		if err := waitReady(ctx, cfg.Ready, cfg.ReadyTimeout, s.app); err != nil {
-			s.Close()
-			return nil, err
-		}
-	} else if cfg.App != "" {
-		time.Sleep(2 * time.Second)
-		if err := s.app.exited(); err != nil {
-			s.Close()
-			return nil, err
-		}
 	}
 
 	if s.base, err = s.db.Save(ctx); err != nil {
@@ -213,6 +222,35 @@ func Open(ctx context.Context, cfg Config) (*Session, error) {
 		return nil, fmt.Errorf("save database state: %w", err)
 	}
 	return s, nil
+}
+
+// startApp starts the app and waits until it is ready.
+func (s *Session) startApp(ctx context.Context) error {
+	var err error
+	if s.app, err = startApp(s.cfg.App, s.appURL, s.appAddr, s.cfg.AppLog); err != nil {
+		return err
+	}
+	if s.cfg.Ready != "" {
+		return waitReady(ctx, s.cfg.Ready, s.cfg.ReadyTimeout, s.app)
+	}
+	time.Sleep(2 * time.Second)
+	return s.app.exited()
+}
+
+// reset puts the database back to its saved contents and, with
+// RestartApp, restarts the app so that nothing it kept in memory from the
+// previous run (a cache, a counter) changes the next one.
+func (s *Session) reset(ctx context.Context) error {
+	if err := s.db.Restore(ctx, s.base); err != nil {
+		return err
+	}
+	if s.cfg.RestartApp && s.app != nil {
+		s.app.stop()
+		if err := s.startApp(ctx); err != nil {
+			return fmt.Errorf("restart app: %w", err)
+		}
+	}
+	return nil
 }
 
 // Close restores the database and stops the app and the proxy.
@@ -240,6 +278,7 @@ func (s *Session) Hunt(ctx context.Context, sc Scenario) (*Report, error) {
 		return nil, errors.New("give one request command, or two to race against each other")
 	}
 	db, p, base, logf := s.db, s.p, s.base, s.logf
+	reset := func() error { return s.reset(ctx) }
 	defer db.Restore(context.Background(), base)
 	rep := &Report{Name: sc.Name, Requests: sc.Requests}
 	ignore := map[string]bool{}
@@ -254,7 +293,7 @@ func (s *Session) Hunt(ctx context.Context, sc Scenario) (*Report, error) {
 	}
 
 	// 1. Record one run of the request.
-	if err := db.Restore(ctx, base); err != nil {
+	if err := reset(); err != nil {
 		return nil, err
 	}
 	p.StartRecording()
@@ -264,7 +303,7 @@ func (s *Session) Hunt(ctx context.Context, sc Scenario) (*Report, error) {
 		logf("record exit=%d %s", rec.ExitCode, oneLine(rec.Output))
 	}
 	if len(sc.Requests) == 2 {
-		if err := db.Restore(ctx, base); err != nil {
+		if err := reset(); err != nil {
 			return nil, err
 		}
 		p.StartRecording()
@@ -277,6 +316,11 @@ func (s *Session) Hunt(ctx context.Context, sc Scenario) (*Report, error) {
 	rep.Steps = analyze.Steps(execs, db.DefaultIsolation(ctx))
 	cands := analyze.Find(rep.Steps)
 	logf("record %d statements, %d candidate race(s)", len(execs), len(cands))
+	if s.cfg.Verbose {
+		for i, c := range cands {
+			logf("cand   #%d %s on %s, read %s, held at %q", i+1, c.Pattern, c.Write.Stmt.Target, strings.Join(c.Read.Stmt.Reads, ","), oneLine(c.Gate.SQL))
+		}
+	}
 	if len(cands) == 0 {
 		return rep, nil
 	}
@@ -287,7 +331,7 @@ func (s *Session) Hunt(ctx context.Context, sc Scenario) (*Report, error) {
 	// vary on their own.
 	reqs := [2]string{reqA, reqB}
 	serial := func(first, second int) (dbstate.State, [2]RunResult, error) {
-		if err := db.Restore(ctx, base); err != nil {
+		if err := reset(); err != nil {
 			return nil, [2]RunResult{}, err
 		}
 		var out [2]RunResult
@@ -314,21 +358,34 @@ func (s *Session) Hunt(ctx context.Context, sc Scenario) (*Report, error) {
 		return nil, err
 	}
 	states := []dbstate.State{s1, s2}
+	serialState := func(st dbstate.State) bool {
+		for _, s := range states {
+			if len(dbstate.Diff(s, st, unstable)) == 0 {
+				return true
+			}
+		}
+		return false
+	}
 
 	// 3. Race each candidate.
+	if n := len(cands) - s.cfg.MaxCandidates; n > 0 {
+		rep.Untested = n
+		cands = cands[:s.cfg.MaxCandidates]
+		logf("max    testing %d of %d candidates; raise --max to test the other %d", len(cands), len(cands)+n, n)
+	}
+	seen := map[string]int{}
 	for i, c := range cands {
-		if i >= s.cfg.MaxCandidates {
-			break
-		}
 		f := Finding{Candidate: c, Serial: serialOut}
-		if err := db.Restore(ctx, base); err != nil {
+		if err := reset(); err != nil {
 			return nil, err
 		}
 		g := proxy.NewGate(c.GateFP, 2, s.cfg.BarrierTimeout)
 		p.SetGate(g)
 		p.StartRecording()
 		f.Started = time.Now()
+		stop := s.openOnLock(ctx, g, &f.Blocked)
 		f.Outputs = concurrent(ctx, reqA, reqB)
+		stop()
 		f.Trace = p.StopRecording()
 		p.SetGate(nil)
 		arrived, timedOut := g.Result()
@@ -339,15 +396,8 @@ func (s *Session) Hunt(ctx context.Context, sc Scenario) (*Report, error) {
 			rep.Findings = append(rep.Findings, f)
 			continue
 		}
-		matches := false
-		for _, s := range states {
-			if len(dbstate.Diff(s, st, unstable)) == 0 {
-				matches = true
-				break
-			}
-		}
 		switch {
-		case !matches:
+		case !serialState(st):
 			f.Outcome = Confirmed
 			// Show the difference from the closest serial outcome.
 			for _, s := range states {
@@ -355,6 +405,15 @@ func (s *Session) Hunt(ctx context.Context, sc Scenario) (*Report, error) {
 				if f.Diff == nil || size(d) < size(f.Diff) {
 					f.Diff = d
 				}
+			}
+			key := diffKey(f.Diff)
+			if k, ok := seen[key]; ok {
+				f.SameAs, f.Outcome = k, rep.Findings[k-1].Outcome
+				break
+			}
+			seen[key] = len(rep.Findings) + 1
+			if err := s.runFree(ctx, &f, reqA, reqB, capture, serialState); err != nil {
+				return nil, err
 			}
 		case arrived >= 2 && !timedOut:
 			f.Outcome = Held
@@ -365,6 +424,84 @@ func (s *Session) Hunt(ctx context.Context, sc Scenario) (*Report, error) {
 		rep.Findings = append(rep.Findings, f)
 	}
 	return rep, nil
+}
+
+// openOnLock opens the barrier as soon as the request it holds keeps the
+// other one waiting on a lock: the other can then never reach the barrier,
+// and waiting for the timeout only slows the run down. The returned
+// function stops watching.
+func (s *Session) openOnLock(ctx context.Context, g *proxy.Gate, blocked *bool) func() {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		t := time.NewTicker(100 * time.Millisecond)
+		defer t.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-t.C:
+			}
+			if g.Waiting() != 1 {
+				continue
+			}
+			if n, err := s.db.LockWaiters(ctx); err == nil && n > 0 {
+				*blocked = true
+				g.Release()
+				return
+			}
+		}
+	}()
+	return func() { close(done); wg.Wait() }
+}
+
+// runFree runs a confirmed race again without the barrier, the way real
+// clients would send it. When every one of those runs ends with the
+// database aborting a request on a deadlock, the race is held back from
+// "confirmed": the barrier forced an order real traffic cannot reach.
+func (s *Session) runFree(ctx context.Context, f *Finding, reqA, reqB string, capture func() (dbstate.State, error), serial func(dbstate.State) bool) error {
+	for f.FreeRuns < s.cfg.FreeRuns && f.FreeHits == 0 {
+		if err := s.reset(ctx); err != nil {
+			return err
+		}
+		s.p.StartRecording()
+		concurrent(ctx, reqA, reqB)
+		trace := s.p.StopRecording()
+		f.FreeRuns++
+		deadlock := false
+		for _, e := range trace {
+			deadlock = deadlock || strings.HasPrefix(e.Err, "40P01")
+		}
+		// A run where the database aborted one request did not let both
+		// through; whatever state it leaves is not the race.
+		if deadlock {
+			f.FreeDeadlocks++
+			continue
+		}
+		st, err := capture()
+		if err != nil {
+			return err
+		}
+		if !serial(st) {
+			f.FreeHits++
+		}
+	}
+	if f.FreeHits == 0 && f.FreeDeadlocks == f.FreeRuns && f.FreeRuns > 0 {
+		f.Outcome = Deadlock
+	}
+	return nil
+}
+
+// diffKey identifies a database result, so that findings that end in the
+// same state are reported as one race.
+func diffKey(d []dbstate.TableDiff) string {
+	var b strings.Builder
+	for _, t := range d {
+		fmt.Fprintf(&b, "%s\x00%q\x00%q\x01", t.Table, t.OnlyA, t.OnlyB)
+	}
+	return b.String()
 }
 
 func size(d []dbstate.TableDiff) int {
